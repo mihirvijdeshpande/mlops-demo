@@ -1,0 +1,20 @@
+#python exclusions
+venv/
+src/
+
+#airflow locations
+config/
+dags/__pycache__/*
+dags/files/
+dags/output/
+logs/
+plugins/
+dags/__pycache__/airlines_data_import_dag.cpython-312.pyc
+dags/__pycache__/airlines_data_prepare_dag.cpython-312.pyc
+dags/__pycache__/airlines_model_training_dag.cpython-312.pyc
+dags/__pycache__/airlines_model_training.cpython-312.pyc
+dags/__pycache__/load_sql_data.cpython-312.pyc
+dags/__pycache__/pg_to_csv.cpython-312.pyc
+dags/__pycache__/sql_csv_data.cpython-312.pyc
+dags/pg_to_csv.py
+dags/sql_csv_data.py
