@@ -2,6 +2,5 @@
 FROM apache/airflow:3.0.3
 
 USER airflow
-RUN pip install mlflow
-
+RUN pip install mlflow dvc
 # USER airflow

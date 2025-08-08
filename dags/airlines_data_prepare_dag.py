@@ -101,18 +101,18 @@ def split_data(input_path: str):
     }
 
 @dag(
-    dag_id="prepare_airlines_data_dag",
+    dag_id="airlines_data_prepare_dag",
     start_date=pendulum.datetime(2024, 1, 1, tz="UTC"),
     schedule="*/30 * * * *",
     catchup=False,
     tags=["ml", "preprocessing", "flights"],
 )
-def prepare_airlines_data_dag():
+def airlines_data_prepare_dag():
     raw = extract_data()
     selected = select_features(raw)
     cleaned = clean_data(selected)
     encoded = encode_categoricals(cleaned)
     split_data(encoded)
 
-prepare_airlines_data_dag()
+airlines_data_prepare_dag()
 
