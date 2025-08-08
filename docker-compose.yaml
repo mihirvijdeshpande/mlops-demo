@@ -49,7 +49,7 @@ x-airflow-common:
   # In order to add custom dependencies or upgrade provider distributions you can use your extended image.
   # Comment the image line, place your Dockerfile in the directory where you placed the docker-compose.yaml
   # and uncomment the "build" line below, Then run `docker-compose build` to build the images.
-  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.0.3}
+  image: ${AIRFLOW_IMAGE_NAME:-mihirvijdeshpande/airflow:pip-mlflow}
   # build: .
   environment:
     &airflow-common-env
@@ -77,6 +77,7 @@ x-airflow-common:
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+    - mlflow-artifacts:/mlflow/artifacts
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on
@@ -148,8 +149,8 @@ services:
     command: api-server
     ports:
       - "8080:8080"
-    volumes:
-      - mlflow-artifacts:/mlflow/artifacts
+    # volumes:
+    #   - mlflow-artifacts:/mlflow/artifacts
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
       interval: 30s
@@ -172,8 +173,8 @@ services:
       retries: 5
       start_period: 30s
     restart: always
-    volumes:
-      - mlflow-artifacts:/mlflow/artifacts
+    # volumes:
+    #   - mlflow-artifacts:/mlflow/artifacts
     depends_on:
       <<: *airflow-common-depends-on
       airflow-init:
@@ -189,8 +190,8 @@ services:
       retries: 5
       start_period: 30s
     restart: always
-    volumes:
-      - mlflow-artifacts:/mlflow/artifacts
+    # volumes:
+      # - mlflow-artifacts:/mlflow/artifacts
     depends_on:
       <<: *airflow-common-depends-on
       airflow-init:
@@ -214,8 +215,8 @@ services:
       # See https://airflow.apache.org/docs/docker-stack/entrypoint.html#signal-propagation
       DUMB_INIT_SETSID: "0"
     restart: always
-    volumes:
-      - mlflow-artifacts:/mlflow/artifacts
+    # volumes:
+    #   - mlflow-artifacts:/mlflow/artifacts
     depends_on:
       <<: *airflow-common-depends-on
       airflow-apiserver:
@@ -311,14 +312,17 @@ services:
         echo "Change ownership of files in /opt/airflow to ${AIRFLOW_UID}:0"
         echo
         chown -R "${AIRFLOW_UID}:0" /opt/airflow/
+        chown -R "${AIRFLOW_UID}:0" /mlflow/
         echo
         echo "Change ownership of files in shared volumes to ${AIRFLOW_UID}:0"
         echo
         chown -v -R "${AIRFLOW_UID}:0" /opt/airflow/{logs,dags,plugins,config}
+        chown -v -R "${AIRFLOW_UID}:0" /mlflow/artifacts
         echo
         echo "Files in shared volumes:"
         echo
         ls -la /opt/airflow/{logs,dags,plugins,config}
+        ls -la /mlflow
 
     # yamllint enable rule:line-length
     environment:

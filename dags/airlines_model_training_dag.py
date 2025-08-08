@@ -26,7 +26,7 @@ REPORT_PATH = os.path.join(DATA_DIR, "evaluation_report.json")
 
 
 @dag(
-    schedule=None,
+    schedule="*/30 * * * *",
     start_date=pendulum.datetime(2024, 1, 1, tz="UTC"),
     catchup=False,
     tags=["flights", "ml", "regression", "auto-model-select"]
