@@ -9,6 +9,7 @@ import joblib
 import json
 import mlflow
 import mlflow.sklearn
+from mlflow.models import infer_signature  # NEW
 
 DATA_DIR = "/opt/airflow/dags/files/"
 TRAIN_PATH = os.path.join(DATA_DIR, "train.csv")
@@ -57,7 +58,7 @@ def airlines_model_training():
         }
 
         report = {}
-        runs_meta = {}  # NEW: Store model_name -> run_id mapping
+        runs_meta = {}  # store model_name -> run_id mapping
 
         mlflow.set_tracking_uri("http://mlflow:5000")
         mlflow.set_experiment("FlightPricePrediction")
@@ -79,17 +80,28 @@ def airlines_model_training():
                 mlflow.log_metric("RMSE", rmse)
                 mlflow.log_metric("R2", r2)
                 mlflow.log_artifact(joblib_path)
-                mlflow.sklearn.log_model(model, artifact_path="model")
+
+                # NEW: Infer input/output schema for the model
+                signature = infer_signature(
+                    pd.concat([X_train, X_val]),
+                    model.predict(pd.concat([X_train, X_val]))
+                )
+
+                mlflow.sklearn.log_model(
+                    model,
+                    artifact_path="model",
+                    signature=signature
+                )
 
                 report[name] = {"MAE": mae, "RMSE": rmse, "R2": r2}
-                runs_meta[name] = run.info.run_id  # NEW: store run ID
+                runs_meta[name] = run.info.run_id
 
         # Save evaluation metrics
         with open(REPORT_PATH, "w") as f:
             json.dump(report, f, indent=2)
 
         # Save run IDs mapping
-        runs_meta_path = os.path.join(DATA_DIR, "runs_meta.json")  # NEW
+        runs_meta_path = os.path.join(DATA_DIR, "runs_meta.json")
         with open(runs_meta_path, "w") as f:
             json.dump(runs_meta, f, indent=2)
 
@@ -104,13 +116,12 @@ def airlines_model_training():
         print(f"✅ Evaluation report saved to: {log_path}")
 
     @task
-    def register_best_model(report_dict):  # report_dict ensures upstream execution
+    def register_best_model(report_dict):
         runs_meta_path = "/opt/airflow/dags/files/runs_meta.json"
 
         with open(runs_meta_path, "r") as f:
             runs_meta = json.load(f)
 
-        # Pick model with lowest RMSE
         best_model = min(report_dict, key=lambda m: report_dict[m]["RMSE"])
         best_run_id = runs_meta[best_model]
 
@@ -120,13 +131,11 @@ def airlines_model_training():
         mlflow.register_model(
             model_uri=f"runs:/{best_run_id}/model",
             name="FlightPricePredictionModel",
-            # description=f"Best model based on RMSE. Model: {best_model}",
             tags={
                 "dataset": "airlines",
                 "model_name": best_model
             }
         )
-
 
     # DAG structure
     train_json = load_data()
@@ -134,6 +143,6 @@ def airlines_model_training():
     test_json = load_test_data()
     train_and_evaluate_models_output = train_and_evaluate_models(train_json, val_json, test_json)
     log_report_output = log_report(train_and_evaluate_models_output)
-    register_best_model(train_and_evaluate_models_output)  # pass output to ensure dependency
+    register_best_model(train_and_evaluate_models_output)
 
 airlines_model_training()
