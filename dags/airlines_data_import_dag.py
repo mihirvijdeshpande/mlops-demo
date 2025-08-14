@@ -114,7 +114,7 @@ def merge_into_main():
 @dag(
     dag_id="airlines_data_import_dag",
     start_date=pendulum.datetime(2024, 1, 1, tz="UTC"),
-    schedule="*/30 * * * *",
+    schedule=None,
     catchup=False,
     tags=["flights", "postgres", "kaggle"],
 )

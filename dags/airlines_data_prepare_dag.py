@@ -103,7 +103,7 @@ def split_data(input_path: str):
 @dag(
     dag_id="airlines_data_prepare_dag",
     start_date=pendulum.datetime(2024, 1, 1, tz="UTC"),
-    schedule="*/30 * * * *",
+    schedule=None,
     catchup=False,
     tags=["ml", "preprocessing", "flights"],
 )
