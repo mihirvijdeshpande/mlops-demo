@@ -15,6 +15,7 @@ import math
 from evidently.report import Report
 from evidently.metrics import ColumnDriftMetric
 import numpy as np
+import tempfile
 
 from prometheus_fastapi_instrumentator import Instrumentator
 from prometheus_client import Histogram, Counter, Gauge
@@ -44,9 +45,6 @@ predictions_log = []  # list of (predicted, actual)
 MAE_GAUGE = Gauge('model_mae', 'Mean Absolute Error of predictions')
 RMSE_GAUGE = Gauge('model_rmse', 'Root Mean Squared Error of predictions')
 R2_GAUGE = Gauge('model_r2', 'R² score of predictions')
-
-# Path to reference dataset (used for drift comparison)
-REFERENCE_DATA_PATH = "/app/reference_data.csv"
 
 # -----------------
 # MLflow Config
@@ -127,6 +125,28 @@ def encode_input(data: FlightInput):
     for cls in ["Business", "Economy"]:
         feature_dict[f"class_{cls}"] = (data.travel_class == cls)
     return pd.DataFrame([feature_dict])
+
+# -----------------
+# MLflow Utility Functions (inline)
+# -----------------
+def fetch_reference_dataset_from_mlflow(model_version: str) -> pd.DataFrame:
+    """Fetch the reference dataset artifact from MLflow for a given model version."""
+    client = MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
+    run_id = client.get_model_version(MODEL_NAME, model_version).run_id
+
+    artifacts = client.list_artifacts(run_id)
+    ref_file_path = None
+    for artifact in artifacts:
+        if artifact.path.endswith("reference_data.csv"):
+            ref_file_path = artifact.path
+            break
+    if not ref_file_path:
+        raise HTTPException(status_code=500, detail="Reference dataset artifact not found in MLflow.")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        client.download_artifacts(run_id, ref_file_path, tmpdir)
+        csv_path = os.path.join(tmpdir, ref_file_path)
+        return pd.read_csv(csv_path)
 
 # -----------------
 # Model Loader
@@ -234,37 +254,30 @@ async def root():
 @app.post("/drift")
 def check_drift():
     """
-    Runs a feature drift check between reference data and recent prediction inputs.
+    Runs a feature drift check between reference data (from MLflow artifact) and recent prediction inputs.
     Updates Prometheus metric for Grafana.
     """
-    import json
+    # 1. Fetch reference dataset from MLflow for current model version
+    try:
+        reference_df = fetch_reference_dataset_from_mlflow(model_version)
+    except Exception as e:
+        logger.error(f"Failed to fetch reference data from MLflow: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    # 1. Load reference dataset (training data snapshot)
-    if not os.path.exists(REFERENCE_DATA_PATH):
-        logger.error("Reference dataset not found.")
-        raise HTTPException(status_code=500, detail="Reference dataset not found.")
-
-    reference_df = pd.read_csv(REFERENCE_DATA_PATH)
-
-    # 2. Load recent input data for drift detection (could be a rolling CSV or DB table)
+    # 2. Load recent input data for drift detection
     recent_data_path = "/app/recent_predictions.csv"
     if not os.path.exists(recent_data_path):
         logger.error("No recent prediction data available.")
         raise HTTPException(status_code=500, detail="No recent prediction data available.")
-
     current_df = pd.read_csv(recent_data_path)
 
-    # 3. Run Evidently drift report (per feature drift)
+    # 3. Run Evidently drift report
     drift_report = Report(metrics=[ColumnDriftMetric(column_name=col) for col in reference_df.columns])
     drift_report.run(reference_data=reference_df, current_data=current_df)
-
     drift_results = drift_report.as_dict()
 
     # 4. Calculate average drift score for Prometheus
-    drift_flags = []
-    for metric in drift_results["metrics"]:
-        drift_flags.append(1 if metric["result"]["drift_detected"] else 0)
-
+    drift_flags = [1 if metric["result"]["drift_detected"] else 0 for metric in drift_results["metrics"]]
     avg_drift_score = np.mean(drift_flags) if drift_flags else 0
     DRIFT_SCORE.set(avg_drift_score)
 
@@ -277,19 +290,12 @@ def check_drift():
 
 @app.post("/perf/log")
 def log_performance(predicted_price: float, actual_price: float):
-    """
-    Manually log actual flight price after checking real booking sites.
-    """
     predictions_log.append((predicted_price, actual_price))
     logger.info(f"Logged actual price: predicted={predicted_price}, actual={actual_price}")
     return {"status": "logged", "total_records": len(predictions_log)}
 
 @app.get("/perf")
 def get_performance_metrics():
-    """
-    Calculate MAE, RMSE, and R² based on logged predictions vs actuals.
-    Updates Prometheus metrics for Grafana visualization.
-    """
     if not predictions_log:
         return {"error": "No performance data logged yet."}
 
@@ -304,7 +310,6 @@ def get_performance_metrics():
     MAE_GAUGE.set(mae)
     RMSE_GAUGE.set(rmse)
     R2_GAUGE.set(r2)
-
     logger.info(f"Performance metrics - MAE: {mae:.2f}, RMSE: {rmse:.2f}, R²: {r2:.2f}")
     return {
         "mae": mae,
