@@ -1,6 +1,6 @@
 #python exclusions
 venv/
-src/
+# src/
 
 #airflow locations
 config/
