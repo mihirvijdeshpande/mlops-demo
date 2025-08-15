@@ -13,7 +13,6 @@ from mlflow.models import infer_signature  # NEW
 
 DATA_DIR = "/opt/airflow/dags/files/"
 TRAIN_PATH = os.path.join(DATA_DIR, "train.csv")
-VAL_PATH = os.path.join(DATA_DIR, "val.csv")
 TEST_PATH = os.path.join(DATA_DIR, "test.csv")
 MODEL_DIR = os.path.join(DATA_DIR, "models/")
 REPORT_PATH = os.path.join(DATA_DIR, "evaluation_report.json")
@@ -31,25 +30,18 @@ def airlines_model_training():
         return pd.read_csv(TRAIN_PATH).to_json(orient="split")
 
     @task
-    def load_validation_data():
-        return pd.read_csv(VAL_PATH).to_json(orient="split")
-
-    @task
     def load_test_data():
         return pd.read_csv(TEST_PATH).to_json(orient="split")
 
     @task
-    def train_and_evaluate_models(train_json, val_json, test_json):
+    def train_and_evaluate_models(train_json, test_json):
         os.makedirs(MODEL_DIR, exist_ok=True)
         train_df = pd.read_json(train_json, orient="split")
-        val_df = pd.read_json(val_json, orient="split")
         test_df = pd.read_json(test_json, orient="split")
 
-        X_train = train_df.drop(columns=["price"])
+        x_train = train_df.drop(columns=["price"])
         y_train = train_df["price"]
-        X_val = val_df.drop(columns=["price"])
-        y_val = val_df["price"]
-        X_test = test_df.drop(columns=["price"])
+        x_test = test_df.drop(columns=["price"])
         y_test = test_df["price"]
 
         models = {
@@ -65,8 +57,8 @@ def airlines_model_training():
 
         for name, model in models.items():
             with mlflow.start_run(run_name=name) as run:
-                model.fit(pd.concat([X_train, X_val]), pd.concat([y_train, y_val]))
-                preds = model.predict(X_test)
+                model.fit(x_train, y_train)
+                preds = model.predict(x_test)
 
                 mae = mean_absolute_error(y_test, preds)
                 rmse = root_mean_squared_error(y_test, preds)
@@ -83,8 +75,8 @@ def airlines_model_training():
 
                 # NEW: Infer input/output schema for the model
                 signature = infer_signature(
-                    pd.concat([X_train, X_val]),
-                    model.predict(pd.concat([X_train, X_val]))
+                    x_train,
+                    model.predict(x_train)
                 )
 
                 mlflow.sklearn.log_model(
@@ -139,9 +131,8 @@ def airlines_model_training():
 
     # DAG structure
     train_json = load_data()
-    val_json = load_validation_data()
     test_json = load_test_data()
-    train_and_evaluate_models_output = train_and_evaluate_models(train_json, val_json, test_json)
+    train_and_evaluate_models_output = train_and_evaluate_models(train_json, test_json)
     log_report_output = log_report(train_and_evaluate_models_output)
     register_best_model(train_and_evaluate_models_output)
 

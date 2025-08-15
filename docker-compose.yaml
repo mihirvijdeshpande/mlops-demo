@@ -122,8 +122,6 @@ services:
     image: python:3.10-slim
     ports:
       - "5000:5000"
-      - "8000:8000"
-      - "8001:8001"
     volumes:
       - mlflow-artifacts:/mlflow/artifacts
     environment:
