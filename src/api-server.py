@@ -46,6 +46,15 @@ MAE_GAUGE = Gauge('model_mae', 'Mean Absolute Error of predictions')
 RMSE_GAUGE = Gauge('model_rmse', 'Root Mean Squared Error of predictions')
 R2_GAUGE = Gauge('model_r2', 'R² score of predictions')
 
+# Store prediction data
+DATA_DIR = "/app/data"
+RECENT_PREDICTIONS_CSV = os.path.join(DATA_DIR, "recent_predictions.csv")
+PREDICTIONS_LOG_FILE = os.path.join(DATA_DIR, "perf.log")
+RETRAINING_DATASET_CSV = os.path.join(DATA_DIR, "retraining_dataset.csv")
+# Tolerance (in seconds) for matching feature and perf logs by timestamp
+RETRAIN_MATCH_TOLERANCE_SEC = 300
+
+
 # -----------------
 # MLflow Config
 # -----------------
@@ -128,6 +137,42 @@ def encode_input(data: FlightInput):
         feature_dict[f"class_{cls}"] = (data.travel_class == cls)
     return pd.DataFrame([feature_dict])
 
+# Write data to device
+def append_recent_input(df: pd.DataFrame):
+    """
+    Append encoded input rows to RECENT_PREDICTIONS_CSV with a stable schema.
+    If the file does not exist, write with header. If it exists, append without header.
+    """
+    try:
+        # Add optional metadata columns if useful for drift filtering later
+        df_to_write = df.copy()
+        df_to_write["logged_at"] = pd.Timestamp.utcnow().isoformat()
+
+        # If file exists, align columns to existing header to avoid drifting schema
+        if os.path.exists(RECENT_PREDICTIONS_CSV):
+            try:
+                # Read only header to get column order
+                existing_cols = pd.read_csv(RECENT_PREDICTIONS_CSV, nrows=0).columns.tolist()
+                # Ensure all existing columns are present in df (add missing as NaN/False)
+                for c in existing_cols:
+                    if c not in df_to_write.columns:
+                        df_to_write[c] = np.nan
+                # Add any new columns at the end (helps forward-compatibility)
+                for c in df_to_write.columns:
+                    if c not in existing_cols:
+                        existing_cols.append(c)
+                df_to_write = df_to_write[existing_cols]
+                df_to_write.to_csv(RECENT_PREDICTIONS_CSV, mode="a", header=False, index=False)
+            except Exception as e:
+                # If header read fails (corrupt file), rewrite cleanly
+                logger.warning(f"Recent predictions file corrupt or unreadable, rewriting: {e}")
+                df_to_write.to_csv(RECENT_PREDICTIONS_CSV, mode="w", header=True, index=False)
+        else:
+            # First write
+            df_to_write.to_csv(RECENT_PREDICTIONS_CSV, mode="w", header=True, index=False)
+    except Exception as e:
+        logger.warning(f"Failed to append recent input to CSV: {e}")
+
 # -----------------
 # MLflow Utility Functions (inline)
 # -----------------
@@ -149,6 +194,84 @@ def fetch_reference_dataset_from_mlflow(model_version: str) -> pd.DataFrame:
         client.download_artifacts(run_id, ref_file_path, tmpdir)
         csv_path = os.path.join(tmpdir, ref_file_path)
         return pd.read_csv(csv_path)
+
+def _load_recent_features_tail(n_rows: int = 500) -> pd.DataFrame:
+    """
+    Load up to the last n_rows of the features CSV for quick nearest-timestamp match.
+    Requires 'logged_at' column to exist in recent_predictions.csv.
+    """
+    if not os.path.exists(RECENT_PREDICTIONS_CSV):
+        return pd.DataFrame()
+    try:
+        # Fast path: read tail by reading entire CSV when small; for large files, consider an indexed store
+        df = pd.read_csv(RECENT_PREDICTIONS_CSV)
+        if df.empty or "logged_at" not in df.columns:
+            return pd.DataFrame()
+        if len(df) > n_rows:
+            df = df.tail(n_rows).reset_index(drop=True)
+        df["logged_at_ts"] = pd.to_datetime(df["logged_at"], errors="coerce", utc=True)
+        df = df.dropna(subset=["logged_at_ts"]).reset_index(drop=True)
+        return df
+    except Exception as e:
+        logging.warning(f"Failed to read recent features tail: {e}")
+        return pd.DataFrame()
+
+
+def _select_nearest_feature_row(features_df: pd.DataFrame, target_ts: pd.Timestamp, tolerance_sec: int) -> pd.Series | None:
+    """
+    Given a features_df with 'logged_at_ts', find the row closest in time to target_ts within tolerance.
+    Returns a pandas Series (row) or None if not found.
+    """
+    if features_df.empty:
+        return None
+    # Compute absolute time delta
+    deltas = (features_df["logged_at_ts"] - target_ts).abs()
+    idx = deltas.idxmin()
+    if pd.isna(idx):
+        return None
+    if deltas.loc[idx] <= pd.Timedelta(seconds=tolerance_sec):
+        return features_df.loc[idx]
+    return None
+
+
+def _append_retraining_row(feature_row: pd.Series, actual_price: float):
+    """
+    Append a single row to retraining_dataset.csv combining feature columns plus 'price'.
+    Preserves header and column order based on existing file when present.
+    Drops helper column 'logged_at_ts' if it exists.
+    """
+    try:
+        # Build DataFrame from the matched feature row
+        row_dict = feature_row.to_dict()
+        # Remove helper column if present
+        row_dict.pop("logged_at_ts", None)
+        row_dict.pop("logged_at", None)
+        # Add target
+        row_dict["price"] = float(actual_price)
+
+        out_df = pd.DataFrame([row_dict])
+
+        # Align with existing file columns if file exists
+        if os.path.exists(RETRAINING_DATASET_CSV):
+            try:
+                existing_cols = pd.read_csv(RETRAINING_DATASET_CSV, nrows=0).columns.tolist()
+                for c in existing_cols:
+                    if c not in out_df.columns:
+                        out_df[c] = np.nan
+                for c in out_df.columns:
+                    if c not in existing_cols:
+                        existing_cols.append(c)
+                out_df = out_df[existing_cols]
+                out_df.to_csv(RETRAINING_DATASET_CSV, mode="a", header=False, index=False)
+            except Exception as e:
+                logging.warning(f"Retraining dataset header read failed; rewriting: {e}")
+                out_df.to_csv(RETRAINING_DATASET_CSV, mode="w", header=True, index=False)
+        else:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            out_df.to_csv(RETRAINING_DATASET_CSV, mode="w", header=True, index=False)
+    except Exception as e:
+        logging.warning(f"Failed to append retraining row: {e}")
+
 
 # -----------------
 # Model Loader
@@ -174,13 +297,20 @@ def load_latest_model():
 @app.on_event("startup")
 def startup_event():
     log_json("Starting API and loading model...")
+
+    try:
+        # Ensure data dir exists
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except Exception as e:
+        logger.warning(f"⚠️ Could not create data directory {DATA_DIR}: {e}")
+
     try:
         load_latest_model()
     except Exception as e:
         logger.warning(f"⚠️ Could not load ML model at startup: {e}")
         global model
         model = None
-    # Instrumentator().instrument(app).expose(app)
+
     log_json("Prometheus metrics enabled", endpoint="/metrics")
 
 # -----------------
@@ -225,7 +355,7 @@ def reload_model():
     global model
     try:
         load_latest_model()
-        message = "{\"status\": \"reloaded\", \"model_version\": model_version}"
+        message = {"status": "reloaded", "model_version": model_version}
     except Exception as e:
         log_json("Failed to reload model", error=str(e))
         logger.warning(f"⚠️ Could not load ML model at startup: {e}")
@@ -247,6 +377,14 @@ def predict(input_data: FlightInput):
         PREDICTIONS_FAILED.inc()
         raise HTTPException(status_code=503, detail="Model not available yet")
     encoded_df = encode_input(input_data)
+    
+    # Persist the encoded features for drift analysis (best-effort)
+    try:
+        append_recent_input(encoded_df)
+    except Exception as e:
+        logger.warning(f"Failed to persist recent input for drift: {e}")
+    
+    # Prediction code
     try:
         prediction = model.predict(encoded_df)
         prediction_value = float(prediction[0])
@@ -291,7 +429,7 @@ def check_drift():
         raise HTTPException(status_code=500, detail=str(e))
 
     # 2. Load recent input data for drift detection
-    recent_data_path = "/app/recent_predictions.csv"
+    recent_data_path = RECENT_PREDICTIONS_CSV
     if not os.path.exists(recent_data_path):
         DRIFT_SCORE.set(-1)
         logger.error("No recent prediction data available.")
@@ -344,8 +482,45 @@ def check_drift():
 
 @app.post("/perf/log")
 def log_performance(predicted_price: float, actual_price: float):
+    # Update in-memory stats
     predictions_log.append((predicted_price, actual_price))
     logger.info(f"Logged actual price: predicted={predicted_price}, actual={actual_price}")
+
+    # Build a timestamp for this perf event
+    logged_at_iso = pd.Timestamp.utcnow().isoformat()
+
+    # Best-effort durable append (JSON Lines) for Loki-friendly logs
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        record = {
+            "logged_at": logged_at_iso,
+            "event": "perf_log",
+            "predicted_price": predicted_price,
+            "actual_price": actual_price,
+            "model_name": MODEL_NAME,
+            "model_version": model_version,
+        }
+        with open(PREDICTIONS_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"Failed to persist performance log record: {e}")
+
+    # Synchronously materialize one joined retraining row (best-effort)
+    try:
+        # Load a tail window of recent features for timestamp matching
+        features_tail = _load_recent_features_tail(n_rows=500)
+        if not features_tail.empty:
+            target_ts = pd.to_datetime(logged_at_iso, utc=True)
+            feature_row = _select_nearest_feature_row(features_tail, target_ts, RETRAIN_MATCH_TOLERANCE_SEC)
+            if feature_row is not None:
+                _append_retraining_row(feature_row, actual_price)
+            else:
+                logger.info("No feature row matched within tolerance; skipping retraining append.")
+        else:
+            logger.info("No recent features available to join; skipping retraining append.")
+    except Exception as e:
+        logger.warning(f"Failed to update retraining dataset: {e}")
+
     return {"status": "logged", "total_records": len(predictions_log)}
 
 @app.get("/perf")

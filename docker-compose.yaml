@@ -389,10 +389,12 @@ services:
     command: -config.file=/etc/promtail/config/promtail-config.yml
     volumes:
       - ./monitoring/config/promtail-config.yml:/etc/promtail/config/promtail-config.yml:ro
+      - ./api_data:/api_data:ro
       - /var/log:/var/log:ro
     restart: unless-stopped
     depends_on:
       - loki
+
 
 volumes:
   postgres-db-volume:

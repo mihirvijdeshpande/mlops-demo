@@ -11,8 +11,13 @@ clients:
 scrape_configs:
   - job_name: api-logs
     static_configs:
-      - targets:
-          - localhost
+      - targets: [localhost]
         labels:
           job: api-service
-          __path__: /var/log/api/*.log
+          __path__: /api_data/perf.log
+  # - job_name: varlogs
+  #   static_configs:
+  #     - targets: [localhost]
+  #       labels:
+  #         job: varlogs
+  #         __path__: /var/log/*log
