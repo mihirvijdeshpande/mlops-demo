@@ -4,9 +4,9 @@ global:
 
 scrape_configs:
   # Scrape API metrics
-  - job_name: 'api-service'
+  - job_name: 'api'
     static_configs:
-      - targets: ['api-service:8000']
+      - targets: ['api:8000']
 
   # Scrape Loki’s own metrics
   - job_name: 'loki'

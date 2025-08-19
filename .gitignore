@@ -18,6 +18,7 @@ dags/__pycache__/pg_to_csv.cpython-312.pyc
 dags/__pycache__/sql_csv_data.cpython-312.pyc
 dags/pg_to_csv.py
 dags/sql_csv_data.py
+loki/
 
 #api
 api_data

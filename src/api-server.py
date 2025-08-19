@@ -60,11 +60,13 @@ app = FastAPI(
     title="Flight Price Prediction API",
     description=(
         "Predict flight prices from human-friendly input. "
-        "Model loaded from MLflow Staging.\n\n"
+        "Model loaded from MLflow.\n\n"
         "Metrics available at `/metrics` for Prometheus scraping."
     ),
     version="1.1.0"
 )
+
+Instrumentator().instrument(app).expose(app)
 
 # -----------------
 # Metrics
@@ -134,7 +136,7 @@ def fetch_reference_dataset_from_mlflow(model_version: str) -> pd.DataFrame:
     client = MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
     run_id = client.get_model_version(MODEL_NAME, model_version).run_id
 
-    artifacts = client.list_artifacts(run_id)
+    artifacts = client.list_artifacts(run_id, path="")
     ref_file_path = None
     for artifact in artifacts:
         if artifact.path.endswith("reference_data.csv"):
@@ -151,15 +153,16 @@ def fetch_reference_dataset_from_mlflow(model_version: str) -> pd.DataFrame:
 # -----------------
 # Model Loader
 # -----------------
-def load_latest_staging_model():
+def load_latest_model():
     global model, model_version, model_source
     client = MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
-    latest_versions = client.get_latest_versions(MODEL_NAME, stages=["Staging"])
+    latest_versions = client.get_latest_versions(MODEL_NAME, stages=["Production"])
     if not latest_versions:
-        log_json("No model found in Staging", model_name=MODEL_NAME, level="error")
-        raise RuntimeError(f"No model found in Staging for {MODEL_NAME}")
+        log_json("No model found", model_name=MODEL_NAME, level="error")
+        # raise RuntimeError(f"No model found in Staging for {MODEL_NAME}")
+        raise HTTPException(status_code=503, detail="Model not available yet")
     latest_model = max(latest_versions, key=lambda v: int(v.version))
-    model_uri = f"models:/{MODEL_NAME}/Staging"
+    model_uri = f"models:/{MODEL_NAME}/Production"
     model = mlflow.pyfunc.load_model(model_uri)
     model_version = latest_model.version
     model_source = latest_model.source
@@ -171,8 +174,13 @@ def load_latest_staging_model():
 @app.on_event("startup")
 def startup_event():
     log_json("Starting API and loading model...")
-    load_latest_staging_model()
-    Instrumentator().instrument(app).expose(app)
+    try:
+        load_latest_model()
+    except Exception as e:
+        logger.warning(f"⚠️ Could not load ML model at startup: {e}")
+        global model
+        model = None
+    # Instrumentator().instrument(app).expose(app)
     log_json("Prometheus metrics enabled", endpoint="/metrics")
 
 # -----------------
@@ -197,9 +205,12 @@ async def log_requests(request: Request, call_next):
 # -----------------
 # Endpoints
 # -----------------
-@app.get("/healthcheck")
-def healthcheck():
-    return {"status": "ok", "model_loaded": model is not None}
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "model_loaded": model is not None
+    }
 
 @app.get("/info")
 def info():
@@ -209,14 +220,22 @@ def info():
         "model_source": model_source
     }
 
-@app.post("/reload_model")
+@app.get("/reload_model")
 def reload_model():
+    global model
     try:
-        load_latest_staging_model()
-        return {"status": "reloaded", "model_version": model_version}
+        load_latest_model()
+        message = "{\"status\": \"reloaded\", \"model_version\": model_version}"
     except Exception as e:
         log_json("Failed to reload model", error=str(e))
+        logger.warning(f"⚠️ Could not load ML model at startup: {e}")
+        model = None
+        message = "model not found"
         raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "message": message
+    }
+
 
 @app.post("/predict")
 @PREDICTION_LATENCY.time()
@@ -226,7 +245,7 @@ def predict(input_data: FlightInput):
     if model is None:
         log_json("Prediction failed - model not loaded", request_id=request_id)
         PREDICTIONS_FAILED.inc()
-        raise HTTPException(status_code=500, detail="Model not loaded")
+        raise HTTPException(status_code=503, detail="Model not available yet")
     encoded_df = encode_input(input_data)
     try:
         prediction = model.predict(encoded_df)
@@ -257,36 +276,71 @@ def check_drift():
     Runs a feature drift check between reference data (from MLflow artifact) and recent prediction inputs.
     Updates Prometheus metric for Grafana.
     """
+    # Guard: if model/model_version not available yet
+    if model is None or model_version is None:
+        DRIFT_SCORE.set(-1)
+        logger.error("Drift check requested but model/model_version is not available.")
+        raise HTTPException(status_code=503, detail="Model not loaded yet; drift cannot be computed.")
+
     # 1. Fetch reference dataset from MLflow for current model version
     try:
         reference_df = fetch_reference_dataset_from_mlflow(model_version)
     except Exception as e:
+        DRIFT_SCORE.set(-1)
         logger.error(f"Failed to fetch reference data from MLflow: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
     # 2. Load recent input data for drift detection
     recent_data_path = "/app/recent_predictions.csv"
     if not os.path.exists(recent_data_path):
+        DRIFT_SCORE.set(-1)
         logger.error("No recent prediction data available.")
         raise HTTPException(status_code=500, detail="No recent prediction data available.")
-    current_df = pd.read_csv(recent_data_path)
+    try:
+        current_df = pd.read_csv(recent_data_path)
+    except Exception as e:
+        DRIFT_SCORE.set(-1)
+        logger.error(f"Failed to read recent prediction data: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to read recent prediction data: {e}")
+
+    # Optional: empty-data guard
+    if reference_df.empty or current_df.empty:
+        DRIFT_SCORE.set(-1)
+        logger.error("Reference or current dataset is empty.")
+        raise HTTPException(status_code=500, detail="Reference or current dataset is empty.")
 
     # 3. Run Evidently drift report
-    drift_report = Report(metrics=[ColumnDriftMetric(column_name=col) for col in reference_df.columns])
-    drift_report.run(reference_data=reference_df, current_data=current_df)
-    drift_results = drift_report.as_dict()
+    try:
+        drift_report = Report(metrics=[ColumnDriftMetric(column_name=col) for col in reference_df.columns])
+        drift_report.run(reference_data=reference_df, current_data=current_df)
+        drift_results = drift_report.as_dict()
+    except Exception as e:
+        DRIFT_SCORE.set(-1)
+        logger.error(f"Evidently drift computation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Evidently failed: {e}")
 
     # 4. Calculate average drift score for Prometheus
-    drift_flags = [1 if metric["result"]["drift_detected"] else 0 for metric in drift_results["metrics"]]
-    avg_drift_score = np.mean(drift_flags) if drift_flags else 0
-    DRIFT_SCORE.set(avg_drift_score)
+    try:
+        drift_flags = [1 if metric["result"]["drift_detected"] else 0 for metric in drift_results["metrics"]]
+        avg_drift_score = float(np.mean(drift_flags)) if drift_flags else 0.0
+        DRIFT_SCORE.set(avg_drift_score)
+    except Exception as e:
+        DRIFT_SCORE.set(-1)
+        logger.error(f"Failed to compute/set drift score: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to compute drift score: {e}")
 
-    logger.info(f"Drift check completed. Avg drift score: {avg_drift_score:.2f}")
+    log_json(
+    "Drift check completed",
+    avg_drift_score=avg_drift_score,
+    stage="drift_check",
+    status="success"
+)
 
     return {
         "average_drift_score": avg_drift_score,
         "details": drift_results
     }
+
 
 @app.post("/perf/log")
 def log_performance(predicted_price: float, actual_price: float):
